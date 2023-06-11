@@ -1,18 +1,11 @@
 import { Menu, Transition } from '@headlessui/react';
 import { Fragment, useState } from 'react';
 import { useRecoilValue } from 'recoil';
-import SearchBar from './SearchBar';
-import TrashIcon from '../svg/TrashIcon';
-import GearIcon from '../svg/GearIcon';
-import Settings from './Settings';
-import { Download } from 'lucide-react';
-import NavLink from './NavLink';
-import ExportModel from './ExportConversation/ExportModel';
-import ClearConvos from './ClearConvos';
-import Logout from './Logout';
+import { Download, FileText } from 'lucide-react';
+import {TrashIcon, GearIcon, DotsIcon } from '~/components/svg/';
+import { SearchBar, ClearConvos, Files, Settings, NavLink, Logout, ExportModel } from './';
 import { useAuthContext } from '~/hooks/AuthContext';
 import { cn } from '~/utils/';
-import DotsIcon from '../svg/DotsIcon';
 
 import store from '~/store';
 
@@ -20,6 +13,7 @@ export default function NavLinks({ clearSearch, isSearchEnabled }) {
   const [showExports, setShowExports] = useState(false);
   const [showClearConvos, setShowClearConvos] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showFiles, setShowFiles] = useState(false);
   const { user } = useAuthContext();
 
   const conversation = useRecoilValue(store.conversation) || {};
@@ -99,6 +93,14 @@ export default function NavLinks({ clearSearch, isSearchEnabled }) {
                 <Menu.Item as="div">
                   <NavLink
                     className="flex w-full cursor-pointer items-center gap-3 px-3 py-3 text-sm text-white transition-colors duration-200 hover:bg-gray-700 rounded-none"
+                    svg={() => <FileText className="h-4 w-4" />}
+                    text="My Files"
+                    clickHandler={() => setShowFiles(true)}
+                  />
+                </Menu.Item>
+                <Menu.Item as="div">
+                  <NavLink
+                    className="flex w-full cursor-pointer items-center gap-3 px-3 py-3 text-sm text-white transition-colors duration-200 hover:bg-gray-700 rounded-none"
                     svg={() => <GearIcon />}
                     text="Settings"
                     clickHandler={() => setShowSettings(true)}
@@ -115,6 +117,7 @@ export default function NavLinks({ clearSearch, isSearchEnabled }) {
       </Menu>
       {showExports && <ExportModel open={showExports} onOpenChange={setShowExports} />}
       {showClearConvos && <ClearConvos open={showClearConvos} onOpenChange={setShowClearConvos} />}
+      {showFiles && <Files open={showFiles} onOpenChange={setShowFiles} />}
       {showSettings && <Settings open={showSettings} onOpenChange={setShowSettings} />}
     </>
   );

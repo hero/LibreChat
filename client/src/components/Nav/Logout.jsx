@@ -1,5 +1,5 @@
 import { forwardRef } from 'react';
-import LogOutIcon from '../svg/LogOutIcon';
+import { LogOutIcon } from '../svg/';
 import { useAuthContext } from '~/hooks/AuthContext';
 
 const Logout = forwardRef(() => {

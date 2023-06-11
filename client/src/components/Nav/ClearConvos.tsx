@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Dialog, DialogTemplate } from '../ui/';
-import { ClearChatsButton } from './SettingsTabs/';
 import { useClearConversationsMutation } from '~/data-provider';
+import { Dialog, DialogTemplate } from '../ui/';
+import { ClearChatsButton } from './';
 import store from '~/store';
 
 const ClearConvos = ({ open, onOpenChange }) => {

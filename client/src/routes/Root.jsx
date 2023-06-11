@@ -1,9 +1,8 @@
 /* eslint-disable react-hooks/exhaustive-deps */
 import { useEffect, useState } from 'react';
 import { Outlet } from 'react-router-dom';
+import { Nav, MobileNav} from '../components/Nav';
 import MessageHandler from '../components/MessageHandler';
-import Nav from '../components/Nav';
-import MobileNav from '../components/Nav/MobileNav';
 import {
   useGetSearchEnabledQuery,
   useGetEndpointsQuery,

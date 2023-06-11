@@ -1,5 +1,11 @@
+export { default as Panel } from './Panel';
 export { default as Plugin } from './Plugin';
+export { default as Spinner } from './Spinner';
 export { default as GPTIcon } from './GPTIcon';
-export { default as BingIcon } from './BingIcon';
 export { default as CogIcon } from './CogIcon';
+export { default as BingIcon } from './BingIcon';
+export { default as DotsIcon } from './DotsIcon';
+export { default as GearIcon } from './GearIcon';
+export { default as TrashIcon } from './TrashIcon';
+export { default as LogOutIcon } from './LogOutIcon';
 export { default as MessagesSquared } from './MessagesSquared';
