@@ -1,8 +1,9 @@
 import * as Tabs from '@radix-ui/react-tabs';
 import { CheckIcon } from 'lucide-react';
 import { ThemeContext } from '~/hooks/ThemeContext';
-import React, { useState, useContext, useCallback } from 'react';
+import React, { useState, useEffect, useContext, useCallback } from 'react';
 import { useClearConversationsMutation } from '~/data-provider';
+import store from '~/store';
 
 export const ThemeSelector = ({ theme, onChange }: { theme: string, onChange: (value: string) => void }) => (
   <div className="flex items-center justify-between">
@@ -45,6 +46,15 @@ function General() {
   const { theme, setTheme } = useContext(ThemeContext);
   const clearConvosMutation = useClearConversationsMutation();
   const [confirmClear, setConfirmClear] = useState(false);
+  const { newConversation } = store.useConversation();
+  const { refreshConversations } = store.useConversations();
+
+  useEffect(() => {
+    if (clearConvosMutation.isSuccess) {
+      newConversation();
+      refreshConversations();
+    }
+  }, [clearConvosMutation.isSuccess, newConversation, refreshConversations]);
   
   const clearConvos = useCallback(() => {
     if (confirmClear) {
