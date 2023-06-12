@@ -233,3 +233,9 @@ export type TResetPassword = {
   token: string;
   password: string;
 };
+
+export type File = {
+  name: string;
+  date: number;
+  size: number;
+}
