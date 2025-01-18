@@ -1,5 +1,8 @@
 require('dotenv').config();
 const { KeyvFile } = require('keyv-file');
+const { EModelEndpoint } = require('librechat-data-provider');
+const { getUserKey, checkUserKeyExpiry } = require('~/server/services/UserService');
+const { logger } = require('~/config');
 
 const askBing = async ({
   text,
@@ -13,10 +16,19 @@ const askBing = async ({
   clientId,
   invocationId,
   toneStyle,
-  token,
+  key: expiresAt,
   onProgress,
+  userId,
 }) => {
-  const { BingAIClient } = await import('@waylaidwanderer/chatgpt-api');
+  const isUserProvided = process.env.BINGAI_TOKEN === 'user_provided';
+
+  let key = null;
+  if (expiresAt && isUserProvided) {
+    checkUserKeyExpiry(expiresAt, EModelEndpoint.bingAI);
+    key = await getUserKey({ userId, name: 'bingAI' });
+  }
+
+  const { BingAIClient } = await import('nodejs-gpt');
   const store = {
     store: new KeyvFile({ filename: './data/cache.json' }),
   };
@@ -24,9 +36,9 @@ const askBing = async ({
   const bingAIClient = new BingAIClient({
     // "_U" cookie from bing.com
     // userToken:
-    //   process.env.BINGAI_TOKEN == 'user_provided' ? token : process.env.BINGAI_TOKEN ?? null,
+    //   isUserProvided ? key : process.env.BINGAI_TOKEN ?? null,
     // If the above doesn't work, provide all your cookies as a string instead
-    cookies: process.env.BINGAI_TOKEN == 'user_provided' ? token : process.env.BINGAI_TOKEN ?? null,
+    cookies: isUserProvided ? key : process.env.BINGAI_TOKEN ?? null,
     debug: false,
     cache: store,
     host: process.env.BINGAI_HOST || null,
@@ -81,13 +93,13 @@ const askBing = async ({
     // don't give those parameters for new conversation
     // for new conversation, conversationSignature always is null
     if (conversationSignature) {
-      options.conversationSignature = conversationSignature;
+      options.encryptedConversationSignature = conversationSignature;
       options.clientId = clientId;
       options.invocationId = invocationId;
     }
   }
 
-  console.log('bing options', options);
+  logger.debug('bing options', options);
 
   const res = await bingAIClient.sendMessage(text, options);
 

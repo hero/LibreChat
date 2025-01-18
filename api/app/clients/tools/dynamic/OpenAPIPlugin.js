@@ -1,11 +1,29 @@
 require('dotenv').config();
-const { z } = require('zod');
 const fs = require('fs');
-const yaml = require('js-yaml');
+const { z } = require('zod');
 const path = require('path');
-const { DynamicStructuredTool } = require('langchain/tools');
+const yaml = require('js-yaml');
 const { createOpenAPIChain } = require('langchain/chains');
-const SUFFIX = 'Prioritize using responses for subsequent requests to better fulfill the query.';
+const { DynamicStructuredTool } = require('@langchain/core/tools');
+const { ChatPromptTemplate, HumanMessagePromptTemplate } = require('@langchain/core/prompts');
+const { logger } = require('~/config');
+
+function addLinePrefix(text, prefix = '// ') {
+  return text
+    .split('\n')
+    .map((line) => prefix + line)
+    .join('\n');
+}
+
+function createPrompt(name, functions) {
+  const prefix = `// The ${name} tool has the following functions. Determine the desired or most optimal function for the user's query:`;
+  const functionDescriptions = functions
+    .map((func) => `// - ${func.name}: ${func.description}`)
+    .join('\n');
+  return `${prefix}\n${functionDescriptions}
+// You are an expert manager and scrum master. You must provide a detailed intent to better execute the function.
+// Always format as such: {{"func": "function_name", "intent": "intent and expected result"}}`;
+}
 
 const AuthBearer = z
   .object({
@@ -35,7 +53,7 @@ async function readSpecFile(filePath) {
     }
     return yaml.load(fileContents);
   } catch (e) {
-    console.error(e);
+    logger.error('[readSpecFile] error', e);
     return false;
   }
 }
@@ -66,68 +84,95 @@ async function getSpec(url) {
   return ValidSpecPath.parse(url);
 }
 
-async function createOpenAPIPlugin({ data, llm, user, message, verbose = false }) {
+async function createOpenAPIPlugin({ data, llm, user, message, memory, signal }) {
   let spec;
   try {
-    spec = await getSpec(data.api.url, verbose);
+    spec = await getSpec(data.api.url);
   } catch (error) {
-    verbose && console.debug('getSpec error', error);
+    logger.error('[createOpenAPIPlugin] getSpec error', error);
     return null;
   }
 
   if (!spec) {
-    verbose && console.debug('No spec found');
+    logger.warn('[createOpenAPIPlugin] No spec found');
     return null;
   }
 
   const headers = {};
-  const { auth, description_for_model } = data;
+  const { auth, name_for_model, description_for_model, description_for_human } = data;
   if (auth && AuthDefinition.parse(auth)) {
-    verbose && console.debug('auth detected', auth);
+    logger.debug('[createOpenAPIPlugin] auth detected', auth);
     const { openai } = auth.verification_tokens;
     if (AuthBearer.parse(auth)) {
       headers.authorization = `Bearer ${openai}`;
-      verbose && console.debug('added auth bearer', headers);
+      logger.debug('[createOpenAPIPlugin] added auth bearer', headers);
     }
   }
 
+  const chainOptions = { llm };
+
+  if (data.headers && data.headers['librechat_user_id']) {
+    logger.debug('[createOpenAPIPlugin] id detected', headers);
+    headers[data.headers['librechat_user_id']] = user;
+  }
+
+  if (Object.keys(headers).length > 0) {
+    logger.debug('[createOpenAPIPlugin] headers detected', headers);
+    chainOptions.headers = headers;
+  }
+
+  if (data.params) {
+    logger.debug('[createOpenAPIPlugin] params detected', data.params);
+    chainOptions.params = data.params;
+  }
+
+  let history = '';
+  if (memory) {
+    logger.debug('[createOpenAPIPlugin] openAPI chain: memory detected', memory);
+    const { history: chat_history } = await memory.loadMemoryVariables({});
+    history = chat_history?.length > 0 ? `\n\n## Chat History:\n${chat_history}\n` : '';
+  }
+
+  chainOptions.prompt = ChatPromptTemplate.fromMessages([
+    HumanMessagePromptTemplate.fromTemplate(
+      `# Use the provided API's to respond to this query:\n\n{query}\n\n## Instructions:\n${addLinePrefix(
+        description_for_model,
+      )}${history}`,
+    ),
+  ]);
+
+  const chain = await createOpenAPIChain(spec, chainOptions);
+
+  const { functions } = chain.chains[0].lc_kwargs.llmKwargs;
+
   return new DynamicStructuredTool({
-    name: data.name_for_model,
-    description: `${data.description_for_human} ${SUFFIX}`,
+    name: name_for_model,
+    description_for_model: `${addLinePrefix(description_for_human)}${createPrompt(
+      name_for_model,
+      functions,
+    )}`,
+    description: `${description_for_human}`,
     schema: z.object({
-      query: z
+      func: z
         .string()
         .describe(
-          'For the query, be specific in a conversational manner. It will be interpreted by a human.',
+          `The function to invoke. The functions available are: ${functions
+            .map((func) => func.name)
+            .join(', ')}`,
         ),
+      intent: z
+        .string()
+        .describe('Describe your intent with the function and your expected result'),
     }),
-    func: async () => {
-      const chainOptions = {
-        llm,
-        verbose,
-      };
-
-      if (data.headers && data.headers['librechat_user_id']) {
-        verbose && console.debug('id detected', headers);
-        headers[data.headers['librechat_user_id']] = user;
-      }
-
-      if (Object.keys(headers).length > 0) {
-        verbose && console.debug('headers detected', headers);
-        chainOptions.headers = headers;
-      }
-
-      if (data.params) {
-        verbose && console.debug('params detected', data.params);
-        chainOptions.params = data.params;
-      }
-
-      const chain = await createOpenAPIChain(spec, chainOptions);
-      const result = await chain.run(
-        `${message}\n\n||>Instructions: ${description_for_model}\n${SUFFIX}`,
-      );
-      console.log('api chain run result', result);
-      return result;
+    func: async ({ func = '', intent = '' }) => {
+      const filteredFunctions = functions.filter((f) => f.name === func);
+      chain.chains[0].lc_kwargs.llmKwargs.functions = filteredFunctions;
+      const query = `${message}${func?.length > 0 ? `\n// Intent: ${intent}` : ''}`;
+      const result = await chain.call({
+        query,
+        signal,
+      });
+      return result.response;
     },
   });
 }

@@ -1,9 +1,10 @@
-const { HumanChatMessage, AIChatMessage } = require('langchain/schema');
-const PluginsClient = require('../PluginsClient');
 const crypto = require('crypto');
+const { Constants } = require('librechat-data-provider');
+const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+const PluginsClient = require('../PluginsClient');
 
-jest.mock('../../../lib/db/connectDb');
-jest.mock('../../../models/Conversation', () => {
+jest.mock('~/lib/db/connectDb');
+jest.mock('~/models/Conversation', () => {
   return function () {
     return {
       save: jest.fn(),
@@ -11,6 +12,12 @@ jest.mock('../../../models/Conversation', () => {
     };
   };
 });
+
+const defaultAzureOptions = {
+  azureOpenAIApiInstanceName: 'your-instance-name',
+  azureOpenAIApiDeploymentName: 'your-deployment-name',
+  azureOpenAIApiVersion: '2020-07-01-preview',
+};
 
 describe('PluginsClient', () => {
   let TestAgent;
@@ -41,15 +48,15 @@ describe('PluginsClient', () => {
           return Promise.resolve([]);
         }
 
-        const orderedMessages = TestAgent.constructor.getMessagesForConversation(
-          fakeMessages,
+        const orderedMessages = TestAgent.constructor.getMessagesForConversation({
+          messages: fakeMessages,
           parentMessageId,
-        );
+        });
 
         const chatMessages = orderedMessages.map((msg) =>
           msg?.isCreatedByUser || msg?.role?.toLowerCase() === 'user'
-            ? new HumanChatMessage(msg.text)
-            : new AIChatMessage(msg.text),
+            ? new HumanMessage(msg.text)
+            : new AIMessage(msg.text),
         );
 
         TestAgent.currentMessages = orderedMessages;
@@ -60,7 +67,7 @@ describe('PluginsClient', () => {
         TestAgent.setOptions(opts);
       }
       const conversationId = opts.conversationId || crypto.randomUUID();
-      const parentMessageId = opts.parentMessageId || '00000000-0000-0000-0000-000000000000';
+      const parentMessageId = opts.parentMessageId || Constants.NO_PARENT;
       const userMessageId = opts.overrideParentMessageId || crypto.randomUUID();
       this.pastMessages = await TestAgent.loadHistory(
         conversationId,
@@ -111,7 +118,6 @@ describe('PluginsClient', () => {
       });
 
       const response = await TestAgent.sendMessage(userMessage);
-      console.log(response);
       parentMessageId = response.messageId;
       conversationId = response.conversationId;
       expect(response).toEqual(expectedResult);
@@ -143,6 +149,166 @@ describe('PluginsClient', () => {
       const chatMessages = await TestAgent.loadHistory(conversationId, parentMessageId);
       expect(TestAgent.currentMessages).toHaveLength(4);
       expect(chatMessages[0].text).toEqual(userMessage);
+    });
+  });
+
+  describe('getFunctionModelName', () => {
+    let client;
+
+    beforeEach(() => {
+      client = new PluginsClient('dummy_api_key');
+    });
+
+    test('should return the input when it includes a dash followed by four digits', () => {
+      expect(client.getFunctionModelName('-1234')).toBe('-1234');
+      expect(client.getFunctionModelName('gpt-4-5678-preview')).toBe('gpt-4-5678-preview');
+    });
+
+    test('should return the input for all function-capable models (`0613` models and above)', () => {
+      expect(client.getFunctionModelName('gpt-4-0613')).toBe('gpt-4-0613');
+      expect(client.getFunctionModelName('gpt-4-32k-0613')).toBe('gpt-4-32k-0613');
+      expect(client.getFunctionModelName('gpt-3.5-turbo-0613')).toBe('gpt-3.5-turbo-0613');
+      expect(client.getFunctionModelName('gpt-3.5-turbo-16k-0613')).toBe('gpt-3.5-turbo-16k-0613');
+      expect(client.getFunctionModelName('gpt-3.5-turbo-1106')).toBe('gpt-3.5-turbo-1106');
+      expect(client.getFunctionModelName('gpt-4-1106-preview')).toBe('gpt-4-1106-preview');
+      expect(client.getFunctionModelName('gpt-4-1106')).toBe('gpt-4-1106');
+    });
+
+    test('should return the corresponding model if input is non-function capable (`0314` models)', () => {
+      expect(client.getFunctionModelName('gpt-4-0314')).toBe('gpt-4');
+      expect(client.getFunctionModelName('gpt-4-32k-0314')).toBe('gpt-4');
+      expect(client.getFunctionModelName('gpt-3.5-turbo-0314')).toBe('gpt-3.5-turbo');
+      expect(client.getFunctionModelName('gpt-3.5-turbo-16k-0314')).toBe('gpt-3.5-turbo');
+    });
+
+    test('should return "gpt-3.5-turbo" when the input includes "gpt-3.5-turbo"', () => {
+      expect(client.getFunctionModelName('test gpt-3.5-turbo model')).toBe('gpt-3.5-turbo');
+    });
+
+    test('should return "gpt-4" when the input includes "gpt-4"', () => {
+      expect(client.getFunctionModelName('testing gpt-4')).toBe('gpt-4');
+    });
+
+    test('should return "gpt-3.5-turbo" for input that does not meet any specific condition', () => {
+      expect(client.getFunctionModelName('random string')).toBe('gpt-3.5-turbo');
+      expect(client.getFunctionModelName('')).toBe('gpt-3.5-turbo');
+    });
+  });
+
+  describe('Azure OpenAI tests specific to Plugins', () => {
+    // TODO: add more tests for Azure OpenAI integration with Plugins
+    // let client;
+    // beforeEach(() => {
+    //   client = new PluginsClient('dummy_api_key');
+    // });
+
+    test('should not call getFunctionModelName when azure options are set', () => {
+      const spy = jest.spyOn(PluginsClient.prototype, 'getFunctionModelName');
+      const model = 'gpt-4-turbo';
+
+      // note, without the azure change in PR #1766, `getFunctionModelName` is called twice
+      const testClient = new PluginsClient('dummy_api_key', {
+        agentOptions: {
+          model,
+          agent: 'functions',
+        },
+        azure: defaultAzureOptions,
+      });
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(testClient.agentOptions.model).toBe(model);
+
+      spy.mockRestore();
+    });
+  });
+
+  describe('sendMessage with filtered tools', () => {
+    let TestAgent;
+    const apiKey = 'fake-api-key';
+    const mockTools = [{ name: 'tool1' }, { name: 'tool2' }, { name: 'tool3' }, { name: 'tool4' }];
+
+    beforeEach(() => {
+      TestAgent = new PluginsClient(apiKey, {
+        tools: mockTools,
+        modelOptions: {
+          model: 'gpt-3.5-turbo',
+          temperature: 0,
+          max_tokens: 2,
+        },
+        agentOptions: {
+          model: 'gpt-3.5-turbo',
+        },
+      });
+
+      TestAgent.options.req = {
+        app: {
+          locals: {},
+        },
+      };
+
+      TestAgent.sendMessage = jest.fn().mockImplementation(async () => {
+        const { filteredTools = [], includedTools = [] } = TestAgent.options.req.app.locals;
+
+        if (includedTools.length > 0) {
+          const tools = TestAgent.options.tools.filter((plugin) =>
+            includedTools.includes(plugin.name),
+          );
+          TestAgent.options.tools = tools;
+        } else {
+          const tools = TestAgent.options.tools.filter(
+            (plugin) => !filteredTools.includes(plugin.name),
+          );
+          TestAgent.options.tools = tools;
+        }
+
+        return {
+          text: 'Mocked response',
+          tools: TestAgent.options.tools,
+        };
+      });
+    });
+
+    test('should filter out tools when filteredTools is provided', async () => {
+      TestAgent.options.req.app.locals.filteredTools = ['tool1', 'tool3'];
+      const response = await TestAgent.sendMessage('Test message');
+      expect(response.tools).toHaveLength(2);
+      expect(response.tools).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'tool2' }),
+          expect.objectContaining({ name: 'tool4' }),
+        ]),
+      );
+    });
+
+    test('should only include specified tools when includedTools is provided', async () => {
+      TestAgent.options.req.app.locals.includedTools = ['tool2', 'tool4'];
+      const response = await TestAgent.sendMessage('Test message');
+      expect(response.tools).toHaveLength(2);
+      expect(response.tools).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'tool2' }),
+          expect.objectContaining({ name: 'tool4' }),
+        ]),
+      );
+    });
+
+    test('should prioritize includedTools over filteredTools', async () => {
+      TestAgent.options.req.app.locals.filteredTools = ['tool1', 'tool3'];
+      TestAgent.options.req.app.locals.includedTools = ['tool1', 'tool2'];
+      const response = await TestAgent.sendMessage('Test message');
+      expect(response.tools).toHaveLength(2);
+      expect(response.tools).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'tool1' }),
+          expect.objectContaining({ name: 'tool2' }),
+        ]),
+      );
+    });
+
+    test('should not modify tools when no filters are provided', async () => {
+      const response = await TestAgent.sendMessage('Test message');
+      expect(response.tools).toHaveLength(4);
+      expect(response.tools).toEqual(expect.arrayContaining(mockTools));
     });
   });
 });

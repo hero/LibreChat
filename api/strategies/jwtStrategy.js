@@ -1,5 +1,7 @@
+const { SystemRoles } = require('librechat-data-provider');
 const { Strategy: JwtStrategy, ExtractJwt } = require('passport-jwt');
-const User = require('../models/User');
+const { getUserById, updateUser } = require('~/models');
+const { logger } = require('~/config');
 
 // JWT strategy
 const jwtLogin = async () =>
@@ -10,11 +12,16 @@ const jwtLogin = async () =>
     },
     async (payload, done) => {
       try {
-        const user = await User.findById(payload.id);
+        const user = await getUserById(payload?.id, '-password -__v');
         if (user) {
+          user.id = user._id.toString();
+          if (!user.role) {
+            user.role = SystemRoles.USER;
+            await updateUser(user.id, { role: user.role });
+          }
           done(null, user);
         } else {
-          console.log('JwtStrategy => no user found');
+          logger.warn('[jwtLogin] JwtStrategy => no user found: ' + payload?.id);
           done(null, false);
         }
       } catch (err) {

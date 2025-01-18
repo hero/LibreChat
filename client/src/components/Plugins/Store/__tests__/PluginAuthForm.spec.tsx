@@ -1,4 +1,4 @@
-import { render, screen } from 'layout-test-utils';
+import { render, screen } from 'test/layout-test-utils';
 import userEvent from '@testing-library/user-event';
 import PluginAuthForm from '../PluginAuthForm';
 
@@ -39,6 +39,7 @@ describe('PluginAuthForm', () => {
       action: 'install',
       auth: {
         key: '1234567890',
+        // file deepcode ignore HardcodedNonCryptoSecret/test: test
         secret: '1234567890',
       },
     });

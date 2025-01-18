@@ -1,12 +1,15 @@
-const express = require('express');
 const crypto = require('crypto');
-const router = express.Router();
-const { titleConvoBing, askBing } = require('../../../app');
-const { saveMessage, getConvoTitle, saveConvo, getConvo } = require('../../../models');
-const { handleError, sendMessage, createOnProgress, handleText } = require('./handlers');
-const requireJwtAuth = require('../../../middleware/requireJwtAuth');
+const express = require('express');
+const { Constants } = require('librechat-data-provider');
+const { handleError, sendMessage, createOnProgress, handleText } = require('~/server/utils');
+const { saveMessage, getConvoTitle, saveConvo, getConvo } = require('~/models');
+const { setHeaders } = require('~/server/middleware');
+const { titleConvoBing, askBing } = require('~/app');
+const { logger } = require('~/config');
 
-router.post('/', requireJwtAuth, async (req, res) => {
+const router = express.Router();
+
+router.post('/', setHeaders, async (req, res) => {
   const {
     endpoint,
     text,
@@ -26,7 +29,7 @@ router.post('/', requireJwtAuth, async (req, res) => {
   const conversationId = oldConversationId || crypto.randomUUID();
   const isNewConversation = !oldConversationId;
   const userMessageId = messageId;
-  const userParentMessageId = parentMessageId || '00000000-0000-0000-0000-000000000000';
+  const userParentMessageId = parentMessageId || Constants.NO_PARENT;
   let userMessage = {
     messageId: userMessageId,
     sender: 'User',
@@ -45,7 +48,7 @@ router.post('/', requireJwtAuth, async (req, res) => {
       systemMessage: req.body?.systemMessage ?? null,
       context: req.body?.context ?? null,
       toneStyle: req.body?.toneStyle ?? 'creative',
-      token: req.body?.token ?? null,
+      key: req.body?.key ?? null,
     };
   } else {
     endpointOption = {
@@ -56,19 +59,19 @@ router.post('/', requireJwtAuth, async (req, res) => {
       clientId: req.body?.clientId ?? null,
       invocationId: req.body?.invocationId ?? null,
       toneStyle: req.body?.toneStyle ?? 'creative',
-      token: req.body?.token ?? null,
+      key: req.body?.key ?? null,
     };
   }
 
-  console.log('ask log', {
+  logger.debug('[/ask/bingAI] ask log', {
     userMessage,
     endpointOption,
     conversationId,
   });
 
   if (!overrideParentMessageId) {
-    await saveMessage(userMessage);
-    await saveConvo(req.user.id, {
+    await saveMessage(req, { ...userMessage, user: req.user.id });
+    await saveConvo(req, {
       ...userMessage,
       ...endpointOption,
       conversationId,
@@ -100,16 +103,10 @@ const ask = async ({
   res,
 }) => {
   let { text, parentMessageId: userParentMessageId, messageId: userMessageId } = userMessage;
+  const user = req.user.id;
 
   let responseMessageId = crypto.randomUUID();
-
-  res.writeHead(200, {
-    Connection: 'keep-alive',
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    'Access-Control-Allow-Origin': '*',
-    'X-Accel-Buffering': 'no',
-  });
+  const model = endpointOption?.jailbreak ? 'Sydney' : 'BingAI';
 
   if (preSendRequest) {
     sendMessage(res, { message: userMessage, created: true });
@@ -121,15 +118,17 @@ const ask = async ({
       const currentTimestamp = Date.now();
       if (currentTimestamp - lastSavedTimestamp > 500) {
         lastSavedTimestamp = currentTimestamp;
-        saveMessage({
+        saveMessage(req, {
           messageId: responseMessageId,
-          sender: endpointOption?.jailbreak ? 'Sydney' : 'BingAI',
+          sender: model,
           conversationId,
           parentMessageId: overrideParentMessageId || userMessageId,
+          model,
           text: text,
           unfinished: true,
-          cancelled: false,
           error: false,
+          isCreatedByUser: false,
+          user,
         });
       }
     },
@@ -137,13 +136,14 @@ const ask = async ({
   const abortController = new AbortController();
   let bingConversationId = null;
   if (!isNewConversation) {
-    const convo = await getConvo(req.user.id, conversationId);
+    const convo = await getConvo(user, conversationId);
     bingConversationId = convo.bingConversationId;
   }
 
   try {
     let response = await askBing({
       text,
+      userId: user,
       parentMessageId: userParentMessageId,
       conversationId: bingConversationId ?? conversationId,
       ...endpointOption,
@@ -155,7 +155,11 @@ const ask = async ({
       abortController,
     });
 
-    console.log('BING RESPONSE', response);
+    logger.debug('[/ask/bingAI] BING RESPONSE', response);
+
+    if (response.details && response.details.scores) {
+      logger.debug('[/ask/bingAI] SCORES', response.details.scores);
+    }
 
     const newConversationId = endpointOption?.jailbreak
       ? response.jailbreakConversationId
@@ -182,17 +186,18 @@ const ask = async ({
       messageId: responseMessageId,
       newMessageId: newResponseMessageId,
       parentMessageId: overrideParentMessageId || newUserMessageId,
-      sender: endpointOption?.jailbreak ? 'Sydney' : 'BingAI',
+      sender: model,
       text: await handleText(response, true),
+      model,
       suggestions:
         response.details.suggestedResponses &&
         response.details.suggestedResponses.map((s) => s.text),
       unfinished,
-      cancelled: false,
       error: false,
+      isCreatedByUser: false,
     };
 
-    await saveMessage(responseMessage);
+    await saveMessage(req, { ...responseMessage, user });
     responseMessage.messageId = newResponseMessageId;
 
     let conversationUpdate = {
@@ -206,18 +211,19 @@ const ask = async ({
       conversationUpdate.jailbreakConversationId = response.jailbreakConversationId;
     } else {
       conversationUpdate.jailbreak = false;
-      conversationUpdate.conversationSignature = response.conversationSignature;
+      conversationUpdate.conversationSignature = response.encryptedConversationSignature;
       conversationUpdate.clientId = response.clientId;
       conversationUpdate.invocationId = response.invocationId;
     }
 
-    await saveConvo(req.user.id, conversationUpdate);
+    await saveConvo(req, conversationUpdate);
     userMessage.messageId = newUserMessageId;
 
     // If response has parentMessageId, the fake userMessage.messageId should be updated to the real one.
     if (!overrideParentMessageId) {
-      await saveMessage({
+      await saveMessage(req, {
         ...userMessage,
+        user,
         messageId: userMessageId,
         newMessageId: newUserMessageId,
       });
@@ -225,63 +231,64 @@ const ask = async ({
     userMessageId = newUserMessageId;
 
     sendMessage(res, {
-      title: await getConvoTitle(req.user.id, conversationId),
+      title: await getConvoTitle(user, conversationId),
       final: true,
-      conversation: await getConvo(req.user.id, conversationId),
+      conversation: await getConvo(user, conversationId),
       requestMessage: userMessage,
       responseMessage: responseMessage,
     });
     res.end();
 
-    if (userParentMessageId == '00000000-0000-0000-0000-000000000000') {
+    if (userParentMessageId == Constants.NO_PARENT) {
       const title = await titleConvoBing({
         text,
         response: responseMessage,
       });
 
-      await saveConvo(req.user.id, {
+      await saveConvo(req, {
         conversationId: conversationId,
         title,
       });
     }
   } catch (error) {
-    console.error(error);
+    logger.error('[/ask/bingAI] Error handling BingAI response', error);
     const partialText = getPartialText();
     if (partialText?.length > 2) {
       const responseMessage = {
         messageId: responseMessageId,
-        sender: endpointOption?.jailbreak ? 'Sydney' : 'BingAI',
+        sender: model,
         conversationId,
         parentMessageId: overrideParentMessageId || userMessageId,
         text: partialText,
-        model: endpointOption.modelOptions.model,
+        model,
         unfinished: true,
-        cancelled: false,
         error: false,
+        isCreatedByUser: false,
       };
 
-      saveMessage(responseMessage);
+      saveMessage(req, { ...responseMessage, user });
 
       return {
-        title: await getConvoTitle(req.user.id, conversationId),
+        title: await getConvoTitle(user, conversationId),
         final: true,
-        conversation: await getConvo(req.user.id, conversationId),
+        conversation: await getConvo(user, conversationId),
         requestMessage: userMessage,
         responseMessage: responseMessage,
       };
     } else {
-      console.log(error);
+      logger.error('[/ask/bingAI] Error handling BingAI response', error);
       const errorMessage = {
         messageId: responseMessageId,
-        sender: endpointOption?.jailbreak ? 'Sydney' : 'BingAI',
+        sender: model,
         conversationId,
         parentMessageId: overrideParentMessageId || userMessageId,
         unfinished: false,
-        cancelled: false,
         error: true,
         text: error.message,
+        model,
+        isCreatedByUser: false,
       };
-      await saveMessage(errorMessage);
+      await saveMessage(req, { ...errorMessage, user });
       handleError(res, errorMessage);
     }
   }

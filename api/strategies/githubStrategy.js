@@ -1,47 +1,25 @@
 const { Strategy: GitHubStrategy } = require('passport-github2');
-const config = require('../../config/loader');
-const domains = config.domains;
+const socialLogin = require('./socialLogin');
 
-const User = require('../models/User');
+const getProfileDetails = (profile) => ({
+  email: profile.emails[0].value,
+  id: profile.id,
+  avatarUrl: profile.photos[0].value,
+  username: profile.username,
+  name: profile.displayName,
+  emailVerified: profile.emails[0].verified,
+});
 
-// GitHub strategy
-const githubLogin = async () =>
+const githubLogin = socialLogin('github', getProfileDetails);
+
+module.exports = () =>
   new GitHubStrategy(
     {
       clientID: process.env.GITHUB_CLIENT_ID,
       clientSecret: process.env.GITHUB_CLIENT_SECRET,
-      callbackURL: `${domains.server}${process.env.GITHUB_CALLBACK_URL}`,
+      callbackURL: `${process.env.DOMAIN_SERVER}${process.env.GITHUB_CALLBACK_URL}`,
       proxy: false,
-      scope: ['user:email'], // Request email scope
+      scope: ['user:email'],
     },
-    async (accessToken, refreshToken, profile, cb) => {
-      try {
-        let email;
-        if (profile.emails && profile.emails.length > 0) {
-          email = profile.emails[0].value;
-        }
-
-        const oldUser = await User.findOne({ email });
-        if (oldUser) {
-          return cb(null, oldUser);
-        }
-
-        const newUser = await new User({
-          provider: 'github',
-          githubId: profile.id,
-          username: profile.username,
-          email,
-          emailVerified: profile.emails[0].verified,
-          name: profile.displayName,
-          avatar: profile.photos[0].value,
-        }).save();
-
-        cb(null, newUser);
-      } catch (err) {
-        console.error(err);
-        cb(err);
-      }
-    },
+    githubLogin,
   );
-
-module.exports = githubLogin;

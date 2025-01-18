@@ -1,12 +1,21 @@
-const crypto = require('crypto');
 const Keyv = require('keyv');
-const {
-  encoding_for_model: encodingForModel,
-  get_encoding: getEncoding,
-} = require('@dqbd/tiktoken');
+const crypto = require('crypto');
+const { CohereClient } = require('cohere-ai');
 const { fetchEventSource } = require('@waylaidwanderer/fetch-event-source');
+const { encoding_for_model: encodingForModel, get_encoding: getEncoding } = require('tiktoken');
+const {
+  ImageDetail,
+  EModelEndpoint,
+  resolveHeaders,
+  CohereConstants,
+  mapModelToAzureConfig,
+} = require('librechat-data-provider');
+const { extractBaseURL, constructAzureURL, genAzureChatCompletion } = require('~/utils');
+const { createContextHandlers } = require('./prompts');
+const { createCoherePayload } = require('./llm');
 const { Agent, ProxyAgent } = require('undici');
 const BaseClient = require('./BaseClient');
+const { logger } = require('~/config');
 
 const CHATGPT_MODEL = 'gpt-3.5-turbo';
 const tokenizersCache = {};
@@ -53,7 +62,7 @@ class ChatGPTClient extends BaseClient {
       stop: modelOptions.stop,
     };
 
-    this.isChatGptModel = this.modelOptions.model.startsWith('gpt-');
+    this.isChatGptModel = this.modelOptions.model.includes('gpt-');
     const { isChatGptModel } = this;
     this.isUnofficialChatGptModel =
       this.modelOptions.model.startsWith('text-chat') ||
@@ -143,11 +152,13 @@ class ChatGPTClient extends BaseClient {
     return tokenizer;
   }
 
-  async getCompletion(input, onProgress, abortController = null) {
+  /** @type {getCompletion} */
+  async getCompletion(input, onProgress, onTokenProgress, abortController = null) {
     if (!abortController) {
       abortController = new AbortController();
     }
-    const modelOptions = { ...this.modelOptions };
+
+    let modelOptions = { ...this.modelOptions };
     if (typeof onProgress === 'function') {
       modelOptions.stream = true;
     }
@@ -156,46 +167,192 @@ class ChatGPTClient extends BaseClient {
     } else {
       modelOptions.prompt = input;
     }
+
+    if (this.useOpenRouter && modelOptions.prompt) {
+      delete modelOptions.stop;
+    }
+
     const { debug } = this.options;
-    const url = this.completionsUrl;
+    let baseURL = this.completionsUrl;
     if (debug) {
       console.debug();
-      console.debug(url);
+      console.debug(baseURL);
       console.debug(modelOptions);
       console.debug();
     }
+
     const opts = {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(modelOptions),
       dispatcher: new Agent({
         bodyTimeout: 0,
         headersTimeout: 0,
       }),
     };
 
-    if (this.apiKey && this.options.azure) {
-      opts.headers['api-key'] = this.apiKey;
-    } else if (this.apiKey) {
-      opts.headers.Authorization = `Bearer ${this.apiKey}`;
+    if (this.isVisionModel) {
+      modelOptions.max_tokens = 4000;
+    }
+
+    /** @type {TAzureConfig | undefined} */
+    const azureConfig = this.options?.req?.app?.locals?.[EModelEndpoint.azureOpenAI];
+
+    const isAzure = this.azure || this.options.azure;
+    if (
+      (isAzure && this.isVisionModel && azureConfig) ||
+      (azureConfig && this.isVisionModel && this.options.endpoint === EModelEndpoint.azureOpenAI)
+    ) {
+      const { modelGroupMap, groupMap } = azureConfig;
+      const {
+        azureOptions,
+        baseURL,
+        headers = {},
+        serverless,
+      } = mapModelToAzureConfig({
+        modelName: modelOptions.model,
+        modelGroupMap,
+        groupMap,
+      });
+      opts.headers = resolveHeaders(headers);
+      this.langchainProxy = extractBaseURL(baseURL);
+      this.apiKey = azureOptions.azureOpenAIApiKey;
+
+      const groupName = modelGroupMap[modelOptions.model].group;
+      this.options.addParams = azureConfig.groupMap[groupName].addParams;
+      this.options.dropParams = azureConfig.groupMap[groupName].dropParams;
+      // Note: `forcePrompt` not re-assigned as only chat models are vision models
+
+      this.azure = !serverless && azureOptions;
+      this.azureEndpoint =
+        !serverless && genAzureChatCompletion(this.azure, modelOptions.model, this);
+      if (serverless === true) {
+        this.options.defaultQuery = azureOptions.azureOpenAIApiVersion
+          ? { 'api-version': azureOptions.azureOpenAIApiVersion }
+          : undefined;
+        this.options.headers['api-key'] = this.apiKey;
+      }
+    }
+
+    if (this.options.defaultQuery) {
+      opts.defaultQuery = this.options.defaultQuery;
     }
 
     if (this.options.headers) {
       opts.headers = { ...opts.headers, ...this.options.headers };
     }
 
+    if (isAzure) {
+      // Azure does not accept `model` in the body, so we need to remove it.
+      delete modelOptions.model;
+
+      baseURL = this.langchainProxy
+        ? constructAzureURL({
+          baseURL: this.langchainProxy,
+          azureOptions: this.azure,
+        })
+        : this.azureEndpoint.split(/(?<!\/)\/(chat|completion)\//)[0];
+
+      if (this.options.forcePrompt) {
+        baseURL += '/completions';
+      } else {
+        baseURL += '/chat/completions';
+      }
+
+      opts.defaultQuery = { 'api-version': this.azure.azureOpenAIApiVersion };
+      opts.headers = { ...opts.headers, 'api-key': this.apiKey };
+    } else if (this.apiKey) {
+      opts.headers.Authorization = `Bearer ${this.apiKey}`;
+    }
+
+    if (process.env.OPENAI_ORGANIZATION) {
+      opts.headers['OpenAI-Organization'] = process.env.OPENAI_ORGANIZATION;
+    }
+
+    if (this.useOpenRouter) {
+      opts.headers['HTTP-Referer'] = 'https://librechat.ai';
+      opts.headers['X-Title'] = 'LibreChat';
+    }
+
     if (this.options.proxy) {
       opts.dispatcher = new ProxyAgent(this.options.proxy);
     }
+
+    /* hacky fixes for Mistral AI API:
+      - Re-orders system message to the top of the messages payload, as not allowed anywhere else
+      - If there is only one message and it's a system message, change the role to user
+      */
+    if (baseURL.includes('https://api.mistral.ai/v1') && modelOptions.messages) {
+      const { messages } = modelOptions;
+
+      const systemMessageIndex = messages.findIndex((msg) => msg.role === 'system');
+
+      if (systemMessageIndex > 0) {
+        const [systemMessage] = messages.splice(systemMessageIndex, 1);
+        messages.unshift(systemMessage);
+      }
+
+      modelOptions.messages = messages;
+
+      if (messages.length === 1 && messages[0].role === 'system') {
+        modelOptions.messages[0].role = 'user';
+      }
+    }
+
+    if (this.options.addParams && typeof this.options.addParams === 'object') {
+      modelOptions = {
+        ...modelOptions,
+        ...this.options.addParams,
+      };
+      logger.debug('[ChatGPTClient] chatCompletion: added params', {
+        addParams: this.options.addParams,
+        modelOptions,
+      });
+    }
+
+    if (this.options.dropParams && Array.isArray(this.options.dropParams)) {
+      this.options.dropParams.forEach((param) => {
+        delete modelOptions[param];
+      });
+      logger.debug('[ChatGPTClient] chatCompletion: dropped params', {
+        dropParams: this.options.dropParams,
+        modelOptions,
+      });
+    }
+
+    if (baseURL.startsWith(CohereConstants.API_URL)) {
+      const payload = createCoherePayload({ modelOptions });
+      return await this.cohereChatCompletion({ payload, onTokenProgress });
+    }
+
+    if (baseURL.includes('v1') && !baseURL.includes('/completions') && !this.isChatCompletion) {
+      baseURL = baseURL.split('v1')[0] + 'v1/completions';
+    } else if (
+      baseURL.includes('v1') &&
+      !baseURL.includes('/chat/completions') &&
+      this.isChatCompletion
+    ) {
+      baseURL = baseURL.split('v1')[0] + 'v1/chat/completions';
+    }
+
+    const BASE_URL = new URL(baseURL);
+    if (opts.defaultQuery) {
+      Object.entries(opts.defaultQuery).forEach(([key, value]) => {
+        BASE_URL.searchParams.append(key, value);
+      });
+      delete opts.defaultQuery;
+    }
+
+    const completionsURL = BASE_URL.toString();
+    opts.body = JSON.stringify(modelOptions);
 
     if (modelOptions.stream) {
       // eslint-disable-next-line no-async-promise-executor
       return new Promise(async (resolve, reject) => {
         try {
           let done = false;
-          await fetchEventSource(url, {
+          await fetchEventSource(completionsURL, {
             ...opts,
             signal: abortController.signal,
             async onopen(response) {
@@ -223,7 +380,6 @@ class ChatGPTClient extends BaseClient {
               // workaround for private API not sending [DONE] event
               if (!done) {
                 onProgress('[DONE]');
-                abortController.abort();
                 resolve();
               }
             },
@@ -236,14 +392,13 @@ class ChatGPTClient extends BaseClient {
             },
             onmessage(message) {
               if (debug) {
-                // console.debug(message);
+                console.debug(message);
               }
               if (!message.data || message.event === 'ping') {
                 return;
               }
               if (message.data === '[DONE]') {
                 onProgress('[DONE]');
-                abortController.abort();
                 resolve();
                 done = true;
                 return;
@@ -256,7 +411,7 @@ class ChatGPTClient extends BaseClient {
         }
       });
     }
-    const response = await fetch(url, {
+    const response = await fetch(completionsURL, {
       ...opts,
       signal: abortController.signal,
     });
@@ -272,6 +427,43 @@ class ChatGPTClient extends BaseClient {
       throw error;
     }
     return response.json();
+  }
+
+  /** @type {cohereChatCompletion} */
+  async cohereChatCompletion({ payload, onTokenProgress }) {
+    const cohere = new CohereClient({
+      token: this.apiKey,
+      environment: this.completionsUrl,
+    });
+
+    if (!payload.stream) {
+      const chatResponse = await cohere.chat(payload);
+      return chatResponse.text;
+    }
+
+    const chatStream = await cohere.chatStream(payload);
+    let reply = '';
+    for await (const message of chatStream) {
+      if (!message) {
+        continue;
+      }
+
+      if (message.eventType === 'text-generation' && message.text) {
+        onTokenProgress(message.text);
+        reply += message.text;
+      }
+      /*
+      Cohere API Chinese Unicode character replacement hotfix.
+      Should be un-commented when the following issue is resolved:
+      https://github.com/cohere-ai/cohere-typescript/issues/151
+
+      else if (message.eventType === 'stream-end' && message.response) {
+        reply = message.response.text;
+      }
+      */
+    }
+
+    return reply;
   }
 
   async generateTitle(userMessage, botMessage) {
@@ -430,30 +622,72 @@ ${botMessage.message}
     return returnData;
   }
 
-  async buildPrompt(messages, parentMessageId, { isChatGptModel = false, promptPrefix = null }) {
-    const orderedMessages = this.constructor.getMessagesForConversation(messages, parentMessageId);
-
+  async buildPrompt(messages, { isChatGptModel = false, promptPrefix = null }) {
     promptPrefix = (promptPrefix || this.options.promptPrefix || '').trim();
+
+    // Handle attachments and create augmentedPrompt
+    if (this.options.attachments) {
+      const attachments = await this.options.attachments;
+      const lastMessage = messages[messages.length - 1];
+
+      if (this.message_file_map) {
+        this.message_file_map[lastMessage.messageId] = attachments;
+      } else {
+        this.message_file_map = {
+          [lastMessage.messageId]: attachments,
+        };
+      }
+
+      const files = await this.addImageURLs(lastMessage, attachments);
+      this.options.attachments = files;
+
+      this.contextHandlers = createContextHandlers(this.options.req, lastMessage.text);
+    }
+
+    if (this.message_file_map) {
+      this.contextHandlers = createContextHandlers(
+        this.options.req,
+        messages[messages.length - 1].text,
+      );
+    }
+
+    // Calculate image token cost and process embedded files
+    messages.forEach((message, i) => {
+      if (this.message_file_map && this.message_file_map[message.messageId]) {
+        const attachments = this.message_file_map[message.messageId];
+        for (const file of attachments) {
+          if (file.embedded) {
+            this.contextHandlers?.processFile(file);
+            continue;
+          }
+
+          messages[i].tokenCount =
+            (messages[i].tokenCount || 0) +
+            this.calculateImageTokenCost({
+              width: file.width,
+              height: file.height,
+              detail: this.options.imageDetail ?? ImageDetail.auto,
+            });
+        }
+      }
+    });
+
+    if (this.contextHandlers) {
+      this.augmentedPrompt = await this.contextHandlers.createContext();
+      promptPrefix = this.augmentedPrompt + promptPrefix;
+    }
+
     if (promptPrefix) {
       // If the prompt prefix doesn't end with the end token, add it.
       if (!promptPrefix.endsWith(`${this.endToken}`)) {
         promptPrefix = `${promptPrefix.trim()}${this.endToken}\n\n`;
       }
       promptPrefix = `${this.startToken}Instructions:\n${promptPrefix}`;
-    } else {
-      const currentDateString = new Date().toLocaleDateString('en-us', {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric',
-      });
-      promptPrefix = `${this.startToken}Instructions:\nYou are ChatGPT, a large language model trained by OpenAI. Respond conversationally.\nCurrent date: ${currentDateString}${this.endToken}\n\n`;
     }
-
     const promptSuffix = `${this.startToken}${this.chatGptLabel}:\n`; // Prompt ChatGPT to respond.
 
     const instructionsPayload = {
       role: 'system',
-      name: 'instructions',
       content: promptPrefix,
     };
 
@@ -478,8 +712,8 @@ ${botMessage.message}
     // Iterate backwards through the messages, adding them to the prompt until we reach the max token count.
     // Do this within a recursive async function so that it doesn't block the event loop for too long.
     const buildPromptBody = async () => {
-      if (currentTokenCount < maxTokenCount && orderedMessages.length > 0) {
-        const message = orderedMessages.pop();
+      if (currentTokenCount < maxTokenCount && messages.length > 0) {
+        const message = messages.pop();
         const roleLabel =
           message?.isCreatedByUser || message?.role?.toLowerCase() === 'user'
             ? this.userLabel
@@ -526,8 +760,8 @@ ${botMessage.message}
     const prompt = `${promptBody}${promptSuffix}`;
     if (isChatGptModel) {
       messagePayload.content = prompt;
-      // Add 2 tokens for metadata after all messages have been counted.
-      currentTokenCount += 2;
+      // Add 3 tokens for Assistant Label priming after all messages have been counted.
+      currentTokenCount += 3;
     }
 
     // Use up to `this.maxContextTokens` tokens (prompt + response), but try to leave `this.maxTokens` tokens for the response.
@@ -536,14 +770,10 @@ ${botMessage.message}
       this.maxResponseTokens,
     );
 
-    if (this.options.debug) {
-      console.debug(`Prompt : ${prompt}`);
-    }
-
     if (isChatGptModel) {
       return { prompt: [instructionsPayload, messagePayload], context };
     }
-    return { prompt, context };
+    return { prompt, context, promptTokens: currentTokenCount };
   }
 
   getTokenCount(text) {
@@ -554,33 +784,29 @@ ${botMessage.message}
    * Algorithm adapted from "6. Counting tokens for chat API calls" of
    * https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
    *
-   * An additional 2 tokens need to be added for metadata after all messages have been counted.
+   * An additional 3 tokens need to be added for assistant label priming after all messages have been counted.
    *
-   * @param {*} message
+   * @param {Object} message
    */
   getTokenCountForMessage(message) {
-    let tokensPerMessage;
-    let nameAdjustment;
-    if (this.modelOptions.model.startsWith('gpt-4')) {
-      tokensPerMessage = 3;
-      nameAdjustment = 1;
-    } else {
+    // Note: gpt-3.5-turbo and gpt-4 may update over time. Use default for these as well as for unknown models
+    let tokensPerMessage = 3;
+    let tokensPerName = 1;
+
+    if (this.modelOptions.model === 'gpt-3.5-turbo-0301') {
       tokensPerMessage = 4;
-      nameAdjustment = -1;
+      tokensPerName = -1;
     }
 
-    // Map each property of the message to the number of tokens it contains
-    const propertyTokenCounts = Object.entries(message).map(([key, value]) => {
-      // Count the number of tokens in the property value
-      const numTokens = this.getTokenCount(value);
+    let numTokens = tokensPerMessage;
+    for (let [key, value] of Object.entries(message)) {
+      numTokens += this.getTokenCount(value);
+      if (key === 'name') {
+        numTokens += tokensPerName;
+      }
+    }
 
-      // Adjust by `nameAdjustment` tokens if the property key is 'name'
-      const adjustment = key === 'name' ? nameAdjustment : 0;
-      return numTokens + adjustment;
-    });
-
-    // Sum the number of tokens in all properties and add `tokensPerMessage` for metadata
-    return propertyTokenCounts.reduce((a, b) => a + b, tokensPerMessage);
+    return numTokens;
   }
 }
 

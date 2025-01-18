@@ -1,116 +1,88 @@
 const express = require('express');
-const router = express.Router();
-const { titleConvo, validateTools, PluginsClient } = require('../../../app');
-const { abortMessage, getAzureCredentials } = require('../../../utils');
-const { saveMessage, getConvoTitle, saveConvo, getConvo } = require('../../../models');
+const throttle = require('lodash/throttle');
+const { getResponseSender, Constants, CacheKeys, Time } = require('librechat-data-provider');
+const { initializeClient } = require('~/server/services/Endpoints/gptPlugins');
+const { sendMessage, createOnProgress } = require('~/server/utils');
+const { addTitle } = require('~/server/services/Endpoints/openAI');
+const { saveMessage, updateMessage } = require('~/models');
+const { getLogStores } = require('~/cache');
 const {
-  handleError,
-  sendMessage,
-  createOnProgress,
-  formatSteps,
-  formatAction,
-} = require('./handlers');
-const requireJwtAuth = require('../../../middleware/requireJwtAuth');
+  handleAbort,
+  createAbortController,
+  handleAbortError,
+  setHeaders,
+  validateModel,
+  validateEndpoint,
+  buildEndpointOption,
+  moderateText,
+} = require('~/server/middleware');
+const { validateTools } = require('~/app');
+const { logger } = require('~/config');
 
-const abortControllers = new Map();
+const router = express.Router();
 
-router.post('/abort', requireJwtAuth, async (req, res) => {
-  return await abortMessage(req, res, abortControllers);
-});
+router.use(moderateText);
+router.post('/abort', handleAbort());
 
-router.post('/', requireJwtAuth, async (req, res) => {
-  const { endpoint, text, parentMessageId, conversationId } = req.body;
-  if (text.length === 0) {
-    return handleError(res, { text: 'Prompt empty or too short' });
-  }
-  if (endpoint !== 'gptPlugins') {
-    return handleError(res, { text: 'Illegal request' });
-  }
+router.post(
+  '/',
+  validateEndpoint,
+  validateModel,
+  buildEndpointOption,
+  setHeaders,
+  async (req, res) => {
+    let {
+      text,
+      endpointOption,
+      conversationId,
+      parentMessageId = null,
+      overrideParentMessageId = null,
+    } = req.body;
 
-  const agentOptions = req.body?.agentOptions ?? {
-    agent: 'functions',
-    skipCompletion: true,
-    model: 'gpt-3.5-turbo',
-    temperature: 0,
-    // top_p: 1,
-    // presence_penalty: 0,
-    // frequency_penalty: 0
-  };
+    logger.debug('[/ask/gptPlugins]', { text, conversationId, ...endpointOption });
 
-  const tools = req.body?.tools.map((tool) => tool.pluginKey) ?? [];
-  // build endpoint option
-  const endpointOption = {
-    chatGptLabel: tools.length === 0 ? req.body?.chatGptLabel ?? null : null,
-    promptPrefix: tools.length === 0 ? req.body?.promptPrefix ?? null : null,
-    tools,
-    modelOptions: {
-      model: req.body?.model ?? 'gpt-4',
-      temperature: req.body?.temperature ?? 0,
-      top_p: req.body?.top_p ?? 1,
-      presence_penalty: req.body?.presence_penalty ?? 0,
-      frequency_penalty: req.body?.frequency_penalty ?? 0,
-    },
-    agentOptions: {
-      ...agentOptions,
-      // agent: 'functions'
-    },
-  };
+    let userMessage;
+    let userMessagePromise;
+    let promptTokens;
+    let userMessageId;
+    let responseMessageId;
+    const sender = getResponseSender({
+      ...endpointOption,
+      model: endpointOption.modelOptions.model,
+    });
+    const newConvo = !conversationId;
+    const user = req.user.id;
 
-  console.log('ask log');
-  console.dir({ text, conversationId, endpointOption }, { depth: null });
+    const plugins = [];
 
-  // eslint-disable-next-line no-use-before-define
-  return await ask({
-    text,
-    endpoint,
-    endpointOption,
-    conversationId,
-    parentMessageId,
-    req,
-    res,
-  });
-});
-
-const ask = async ({
-  text,
-  endpoint,
-  endpointOption,
-  parentMessageId = null,
-  conversationId,
-  req,
-  res,
-}) => {
-  res.writeHead(200, {
-    Connection: 'keep-alive',
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    'Access-Control-Allow-Origin': '*',
-    'X-Accel-Buffering': 'no',
-  });
-  let userMessage;
-  let userMessageId;
-  let responseMessageId;
-  let lastSavedTimestamp = 0;
-  const newConvo = !conversationId;
-  const { overrideParentMessageId = null } = req.body;
-  const user = req.user.id;
-
-  const plugin = {
-    loading: true,
-    inputs: [],
-    latest: null,
-    outputs: null,
-  };
-
-  try {
-    const getIds = (data) => {
-      userMessage = data.userMessage;
-      userMessageId = userMessage.messageId;
-      responseMessageId = data.responseMessageId;
-      if (!conversationId) {
-        conversationId = data.conversationId;
+    const getReqData = (data = {}) => {
+      for (let key in data) {
+        if (key === 'userMessage') {
+          userMessage = data[key];
+          userMessageId = data[key].messageId;
+        } else if (key === 'userMessagePromise') {
+          userMessagePromise = data[key];
+        } else if (key === 'responseMessageId') {
+          responseMessageId = data[key];
+        } else if (key === 'promptTokens') {
+          promptTokens = data[key];
+        } else if (!conversationId && key === 'conversationId') {
+          conversationId = data[key];
+        }
       }
     };
+
+    const messageCache = getLogStores(CacheKeys.MESSAGES);
+    const throttledCacheSet = throttle(
+      (text) => {
+        messageCache.set(responseMessageId, text, Time.FIVE_MINUTES);
+      },
+      3000,
+      { trailing: false },
+    );
+
+    let streaming = null;
+    let timer = null;
 
     const {
       onProgress: progressCallback,
@@ -118,167 +90,165 @@ const ask = async ({
       getPartialText,
     } = createOnProgress({
       onProgress: ({ text: partialText }) => {
-        const currentTimestamp = Date.now();
-
-        if (plugin.loading === true) {
-          plugin.loading = false;
+        if (timer) {
+          clearTimeout(timer);
         }
 
-        if (currentTimestamp - lastSavedTimestamp > 500) {
-          lastSavedTimestamp = currentTimestamp;
-          saveMessage({
-            messageId: responseMessageId,
-            sender: 'ChatGPT',
-            conversationId,
-            parentMessageId: overrideParentMessageId || userMessageId,
-            text: partialText,
-            model: endpointOption.modelOptions.model,
-            unfinished: true,
-            cancelled: false,
-            error: false,
-          });
-        }
+        throttledCacheSet(partialText);
+
+        streaming = new Promise((resolve) => {
+          timer = setTimeout(() => {
+            resolve();
+          }, 250);
+        });
       },
     });
 
-    const abortController = new AbortController();
-    abortController.abortAsk = async function () {
-      this.abort();
-
-      const responseMessage = {
+    const pluginMap = new Map();
+    const onAgentAction = async (action, runId) => {
+      pluginMap.set(runId, action.tool);
+      sendIntermediateMessage(res, {
+        plugins,
+        parentMessageId: userMessage.messageId,
         messageId: responseMessageId,
-        sender: endpointOption?.chatGptLabel || 'ChatGPT',
-        conversationId,
-        parentMessageId: overrideParentMessageId || userMessageId,
-        text: getPartialText(),
-        plugin: { ...plugin, loading: false },
-        model: endpointOption.modelOptions.model,
-        unfinished: false,
-        cancelled: true,
-        error: false,
+      });
+    };
+
+    const onToolStart = async (tool, input, runId, parentRunId) => {
+      const pluginName = pluginMap.get(parentRunId);
+      const latestPlugin = {
+        runId,
+        loading: true,
+        inputs: [input],
+        latest: pluginName,
+        outputs: null,
       };
 
-      saveMessage(responseMessage);
-
-      return {
-        title: await getConvoTitle(req.user.id, conversationId),
-        final: true,
-        conversation: await getConvo(req.user.id, conversationId),
-        requestMessage: userMessage,
-        responseMessage: responseMessage,
-      };
-    };
-
-    const onStart = (userMessage) => {
-      sendMessage(res, { message: userMessage, created: true });
-      abortControllers.set(userMessage.conversationId, { abortController, ...endpointOption });
-    };
-
-    endpointOption.tools = await validateTools(user, endpointOption.tools);
-    const clientOptions = {
-      debug: true,
-      endpoint,
-      reverseProxyUrl: process.env.OPENAI_REVERSE_PROXY || null,
-      proxy: process.env.PROXY || null,
-      ...endpointOption,
-    };
-
-    let openAIApiKey = req.body?.token ?? process.env.OPENAI_API_KEY;
-    if (process.env.PLUGINS_USE_AZURE) {
-      clientOptions.azure = getAzureCredentials();
-      openAIApiKey = clientOptions.azure.azureOpenAIApiKey;
-    }
-
-    if (openAIApiKey && openAIApiKey.includes('azure') && !clientOptions.azure) {
-      clientOptions.azure = JSON.parse(req.body?.token) ?? getAzureCredentials();
-      openAIApiKey = clientOptions.azure.azureOpenAIApiKey;
-    }
-    const chatAgent = new PluginsClient(openAIApiKey, clientOptions);
-
-    const onAgentAction = (action, start = false) => {
-      const formattedAction = formatAction(action);
-      plugin.inputs.push(formattedAction);
-      plugin.latest = formattedAction.plugin;
-      if (!start) {
-        saveMessage(userMessage);
+      if (streaming) {
+        await streaming;
       }
-      sendIntermediateMessage(res, { plugin });
-      // console.log('PLUGIN ACTION', formattedAction);
-    };
-
-    const onChainEnd = (data) => {
-      let { intermediateSteps: steps } = data;
-      plugin.outputs = steps && steps[0].action ? formatSteps(steps) : 'An error occurred.';
-      plugin.loading = false;
-      saveMessage(userMessage);
-      sendIntermediateMessage(res, { plugin });
-      // console.log('CHAIN END', plugin.outputs);
-    };
-
-    let response = await chatAgent.sendMessage(text, {
-      getIds,
-      user,
-      parentMessageId,
-      conversationId,
-      overrideParentMessageId,
-      onAgentAction,
-      onChainEnd,
-      onStart,
-      ...endpointOption,
-      onProgress: progressCallback.call(null, {
+      const extraTokens = ':::plugin:::\n';
+      plugins.push(latestPlugin);
+      sendIntermediateMessage(
         res,
-        text,
-        plugin,
-        parentMessageId: overrideParentMessageId || userMessageId,
-      }),
-      abortController,
-    });
-
-    if (overrideParentMessageId) {
-      response.parentMessageId = overrideParentMessageId;
-    }
-
-    console.log('CLIENT RESPONSE');
-    console.dir(response, { depth: null });
-    response.plugin = { ...plugin, loading: false };
-    await saveMessage(response);
-
-    sendMessage(res, {
-      title: await getConvoTitle(req.user.id, conversationId),
-      final: true,
-      conversation: await getConvo(req.user.id, conversationId),
-      requestMessage: userMessage,
-      responseMessage: response,
-    });
-    res.end();
-
-    if (parentMessageId == '00000000-0000-0000-0000-000000000000' && newConvo) {
-      const title = await titleConvo({
-        text,
-        response,
-        openAIApiKey,
-        azure: !!clientOptions.azure,
-      });
-      await saveConvo(req.user.id, {
-        conversationId: conversationId,
-        title,
-      });
-    }
-  } catch (error) {
-    console.error(error);
-    const errorMessage = {
-      messageId: responseMessageId,
-      sender: 'ChatGPT',
-      conversationId,
-      parentMessageId: userMessageId,
-      unfinished: false,
-      cancelled: false,
-      error: true,
-      text: error.message,
+        { plugins, parentMessageId: userMessage.messageId, messageId: responseMessageId },
+        extraTokens,
+      );
     };
-    await saveMessage(errorMessage);
-    handleError(res, errorMessage);
-  }
-};
+
+    const onToolEnd = async (output, runId) => {
+      if (streaming) {
+        await streaming;
+      }
+
+      const pluginIndex = plugins.findIndex((plugin) => plugin.runId === runId);
+
+      if (pluginIndex !== -1) {
+        plugins[pluginIndex].loading = false;
+        plugins[pluginIndex].outputs = output;
+      }
+    };
+
+    const getAbortData = () => ({
+      sender,
+      conversationId,
+      userMessagePromise,
+      messageId: responseMessageId,
+      parentMessageId: overrideParentMessageId ?? userMessageId,
+      text: getPartialText(),
+      plugins: plugins.map((p) => ({ ...p, loading: false })),
+      userMessage,
+      promptTokens,
+    });
+    const { abortController, onStart } = createAbortController(req, res, getAbortData, getReqData);
+
+    try {
+      endpointOption.tools = await validateTools(user, endpointOption.tools);
+      const { client } = await initializeClient({ req, res, endpointOption });
+
+      const onChainEnd = () => {
+        if (!client.skipSaveUserMessage) {
+          saveMessage(
+            req,
+            { ...userMessage, user },
+            { context: 'api/server/routes/ask/gptPlugins.js - onChainEnd' },
+          );
+        }
+        sendIntermediateMessage(res, {
+          plugins,
+          parentMessageId: userMessage.messageId,
+          messageId: responseMessageId,
+        });
+      };
+
+      let response = await client.sendMessage(text, {
+        user,
+        conversationId,
+        parentMessageId,
+        overrideParentMessageId,
+        getReqData,
+        onAgentAction,
+        onChainEnd,
+        onToolStart,
+        onToolEnd,
+        onStart,
+        getPartialText,
+        ...endpointOption,
+        progressCallback,
+        progressOptions: {
+          res,
+          // parentMessageId: overrideParentMessageId || userMessageId,
+          plugins,
+        },
+        abortController,
+      });
+
+      if (overrideParentMessageId) {
+        response.parentMessageId = overrideParentMessageId;
+      }
+
+      logger.debug('[/ask/gptPlugins]', response);
+
+      const { conversation = {} } = await client.responsePromise;
+      conversation.title =
+        conversation && !conversation.title ? null : conversation?.title || 'New Chat';
+
+      sendMessage(res, {
+        title: conversation.title,
+        final: true,
+        conversation,
+        requestMessage: userMessage,
+        responseMessage: response,
+      });
+      res.end();
+
+      if (parentMessageId === Constants.NO_PARENT && newConvo) {
+        addTitle(req, {
+          text,
+          response,
+          client,
+        });
+      }
+
+      response.plugins = plugins.map((p) => ({ ...p, loading: false }));
+      if (response.plugins?.length > 0) {
+        await updateMessage(
+          req,
+          { ...response, user },
+          { context: 'api/server/routes/ask/gptPlugins.js - save plugins used' },
+        );
+      }
+    } catch (error) {
+      const partialText = getPartialText();
+      handleAbortError(res, req, error, {
+        partialText,
+        conversationId,
+        sender,
+        messageId: responseMessageId,
+        parentMessageId: userMessageId ?? parentMessageId,
+      });
+    }
+  },
+);
 
 module.exports = router;

@@ -7,18 +7,26 @@ const {
   ChatPromptTemplate,
   SystemMessagePromptTemplate,
   HumanMessagePromptTemplate,
-} = require('langchain/prompts');
+} = require('@langchain/core/prompts');
 
 const initializeCustomAgent = async ({
   tools,
   model,
   pastMessages,
+  customName,
+  customInstructions,
   currentDateString,
   ...rest
 }) => {
   let prompt = CustomAgent.createPrompt(tools, { currentDateString, model: model.modelName });
+  if (customName) {
+    prompt = `You are "${customName}".\n${prompt}`;
+  }
+  if (customInstructions) {
+    prompt = `${prompt}\n${customInstructions}`;
+  }
 
-  const chatPrompt = ChatPromptTemplate.fromPromptMessages([
+  const chatPrompt = ChatPromptTemplate.fromMessages([
     new SystemMessagePromptTemplate(prompt),
     HumanMessagePromptTemplate.fromTemplate(`{chat_history}
 Query: {input}
@@ -28,6 +36,7 @@ Query: {input}
   const outputParser = new CustomOutputParser({ tools });
 
   const memory = new BufferMemory({
+    llm: model,
     chatHistory: new ChatMessageHistory(pastMessages),
     // returnMessages: true, // commenting this out retains memory
     memoryKey: 'chat_history',

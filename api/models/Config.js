@@ -1,4 +1,6 @@
 const mongoose = require('mongoose');
+const { logger } = require('~/config');
+
 const major = [0, 0];
 const minor = [0, 0];
 const patch = [0, 5];
@@ -55,7 +57,7 @@ configSchema.methods.incrementCount = function () {
 
 // Static methods
 configSchema.statics.findByTag = async function (tag) {
-  return await this.findOne({ tag });
+  return await this.findOne({ tag }).lean();
 };
 
 configSchema.statics.updateByTag = async function (tag, update) {
@@ -67,17 +69,17 @@ const Config = mongoose.models.Config || mongoose.model('Config', configSchema);
 module.exports = {
   getConfigs: async (filter) => {
     try {
-      return await Config.find(filter).exec();
+      return await Config.find(filter).lean();
     } catch (error) {
-      console.error(error);
+      logger.error('Error getting configs', error);
       return { config: 'Error getting configs' };
     }
   },
   deleteConfigs: async (filter) => {
     try {
-      return await Config.deleteMany(filter).exec();
+      return await Config.deleteMany(filter);
     } catch (error) {
-      console.error(error);
+      logger.error('Error deleting configs', error);
       return { config: 'Error deleting configs' };
     }
   },
